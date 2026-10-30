@@ -1802,3 +1802,62 @@ class Connection(object, metaclass=abc.ABCMeta):
         :param inspection_rule_id: ID of the inspection_rule to destroy.
         :raises: inspection_ruleNotFound if the inspection_rule does not exist.
         """
+
+    @abc.abstractmethod
+    def activate_agent_channel(self, node_uuid, execution_id, workflow_epoch,
+                               owner_conductor_id, owner_incarnation,
+                               token_verifier, profile):
+        """Activate an agent channel session for a node.
+
+        Activating a new execution process supersedes the node's previous
+        session atomically and raises the node's fence generation. Repeated
+        activation of the same ``(node, execution_id)`` is idempotent and
+        returns the existing session.
+
+        :param node_uuid: UUID of the node the agent runs on.
+        :param execution_id: Stable UUID of one agent execution process.
+        :param workflow_epoch: Workflow epoch the activation belongs to.
+        :param owner_conductor_id: Database ID of the owning conductor.
+        :param owner_incarnation: Incarnation of the owning conductor.
+        :param token_verifier: Verifier of the agent token, never the token.
+        :param profile: Immutable protocol profile of the session.
+        :returns: A session dict with at least ``uuid`` and ``fence``.
+        :raises: NodeNotFound if the node does not exist.
+        """
+
+    @abc.abstractmethod
+    def publish_agent_command(self, session_uuid, workflow_epoch,
+                              invocation_key, name, params, reply_boundary,
+                              owner_conductor_id, owner_incarnation, fence):
+        """Publish one command into the journal.
+
+        The command UUID and sequence are generated on first publication and
+        are stable for ``(session, workflow_epoch, invocation_key)``. A
+        repeat with the same frozen body returns the stored command.
+
+        :param session_uuid: UUID of the target agent channel session.
+        :param workflow_epoch: Workflow epoch of the command.
+        :param invocation_key: Stable identity of one command in the
+                               workflow.
+        :param name: IPA method name.
+        :param params: JSON object with the frozen method parameters.
+        :param reply_boundary: Reply boundary of the command.
+        :param owner_conductor_id: Database ID of the publishing conductor.
+        :param owner_incarnation: Incarnation of the publishing conductor.
+        :param fence: Fence generation the publisher believes is current.
+        :returns: A command dict.
+        :raises: NotFound if the session does not exist.
+        :raises: AgentChannelFenceConflict if the publisher is stale.
+        :raises: AgentChannelCommandConflict if the same invocation key
+                 already carries a different immutable body.
+        :raises: InvalidParameterValue if ``params`` is not JSON.
+        """
+
+    @abc.abstractmethod
+    def get_agent_channel_command(self, command_uuid):
+        """Return the stored agent channel command with the given UUID.
+
+        :param command_uuid: UUID of the command.
+        :returns: A command dict.
+        :raises: NotFound if the command does not exist.
+        """

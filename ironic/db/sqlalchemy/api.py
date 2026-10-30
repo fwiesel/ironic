@@ -17,8 +17,10 @@
 import collections
 import datetime
 import functools
+import hashlib
 import json
 import logging
+import math
 import threading
 
 from oslo_concurrency import lockutils
@@ -111,6 +113,112 @@ def wrap_sqlite_retry(f):
 def get_backend():
     """The backend is this module itself."""
     return Connection()
+
+
+AGENT_CHANNEL_SESSION_ACTIVE = 'active'
+AGENT_CHANNEL_SESSION_DRAINING = 'draining'
+AGENT_CHANNEL_COMMAND_QUEUED = 'queued'
+
+# The journal accepts only JSON values as command parameters. Keep the
+# validation and the canonical form in one place so that the stored digest
+# and the stored body cannot disagree.
+_AGENT_CHANNEL_JSON_SCALARS = (bool, int, float, str)
+
+
+def _validate_agent_channel_json(value):
+    """Reject everything that is not a JSON value.
+
+    The error message is deliberately free of the offending value: command
+    parameters may carry secrets.
+    """
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise exception.InvalidParameterValue(
+                    _('Agent channel command parameters must be a JSON '
+                      'object with string keys and JSON values.'))
+            _validate_agent_channel_json(item)
+    elif isinstance(value, list):
+        for item in value:
+            _validate_agent_channel_json(item)
+    elif isinstance(value, float):
+        if not math.isfinite(value):
+            raise exception.InvalidParameterValue(
+                _('Agent channel command parameters must not contain NaN '
+                  'or infinite numbers.'))
+    elif value is not None and not isinstance(
+            value, _AGENT_CHANNEL_JSON_SCALARS):
+        raise exception.InvalidParameterValue(
+            _('Agent channel command parameters must be a JSON object '
+              'with string keys and JSON values.'))
+
+
+def _canonical_agent_channel_params(params):
+    """Validate parameters and return their canonical JSON form."""
+    if not isinstance(params, dict):
+        raise exception.InvalidParameterValue(
+            _('Agent channel command parameters must be a JSON object '
+              'with string keys and JSON values.'))
+    _validate_agent_channel_json(params)
+    try:
+        return json.dumps(params, sort_keys=True, separators=(',', ':'),
+                          allow_nan=False)
+    except (TypeError, ValueError):
+        raise exception.InvalidParameterValue(
+            _('Agent channel command parameters must be a JSON object '
+              'with string keys and JSON values.'))
+
+
+def _find_agent_channel_command(session, session_uuid, workflow_epoch,
+                                invocation_key):
+    return (session.query(models.AgentChannelCommand)
+            .filter_by(session_uuid=session_uuid,
+                       workflow_epoch=workflow_epoch,
+                       invocation_key=invocation_key)
+            .one_or_none())
+
+
+def _replay_agent_channel_command(ref, params_sha256, name, reply_boundary):
+    """Return the stored body of a repeated publication.
+
+    A changed name, parameter body, or reply boundary for the same command
+    identity is a conflict. The error never carries parameter values.
+    """
+    if (ref.params_sha256 != params_sha256
+            or ref.name != name
+            or ref.reply_boundary != reply_boundary):
+        raise exception.AgentChannelCommandConflict(command=ref.uuid)
+    return _agent_channel_command_dict(ref)
+
+
+def _agent_channel_command_dict(ref):
+    return {
+        'uuid': ref.uuid,
+        'session_uuid': ref.session_uuid,
+        'workflow_epoch': ref.workflow_epoch,
+        'invocation_key': ref.invocation_key,
+        'sequence': ref.sequence,
+        'name': ref.name,
+        'params': json.loads(json.dumps(ref.params)),
+        'reply_boundary': ref.reply_boundary,
+        'params_sha256': ref.params_sha256,
+        'state': ref.state,
+    }
+
+
+def _agent_channel_session_dict(ref):
+    # NOTE: The token verifier stays in the journal. Callers never need it
+    # and it must not travel back over any API boundary.
+    return {
+        'uuid': ref.uuid,
+        'execution_id': ref.execution_id,
+        'workflow_epoch': ref.workflow_epoch,
+        'fence': ref.fence,
+        'owner_conductor_id': ref.owner_conductor_id,
+        'owner_incarnation': ref.owner_incarnation,
+        'profile': ref.profile,
+        'state': ref.state,
+    }
 
 
 def _session_for_read():
@@ -3500,3 +3608,172 @@ class Connection(api.Connection):
             if count == 0:
                 raise exception.InspectionRuleNotFound(
                     rule=inspection_rule_id)
+
+    @wrap_sqlite_retry
+    @oslo_db_api.retry_on_deadlock
+    def activate_agent_channel(self, node_uuid, execution_id, workflow_epoch,
+                               owner_conductor_id, owner_incarnation,
+                               token_verifier, profile):
+        session_uuid = uuidutils.generate_uuid()
+        with _session_for_write() as session:
+            node_id = session.query(models.Node.id).filter(
+                models.Node.uuid == node_uuid).scalar()
+            if node_id is None:
+                raise exception.NodeNotFound(node=node_uuid)
+
+            # A retried activation of the same execution process must not
+            # fence out the process that is already running.
+            existing = (session.query(models.AgentChannelSession)
+                        .filter_by(node_id=node_id,
+                                   execution_id=execution_id)
+                        .one_or_none())
+            if existing is not None:
+                return _agent_channel_session_dict(existing)
+
+            head = (session.query(models.AgentChannelHead)
+                    .filter_by(node_id=node_id)
+                    .one_or_none())
+            if head is None:
+                try:
+                    with session.begin_nested():
+                        head = models.AgentChannelHead(
+                            node_id=node_id, fence=0,
+                            workflow_epoch=workflow_epoch,
+                            owner_conductor_id=owner_conductor_id,
+                            owner_incarnation=owner_incarnation)
+                        session.add(head)
+                        session.flush()
+                except db_exc.DBDuplicateEntry:
+                    # Another conductor created the head first. Take the
+                    # existing row and let the conditional update below
+                    # decide the fence generation.
+                    head = (session.query(models.AgentChannelHead)
+                            .filter_by(node_id=node_id)
+                            .one())
+
+            # A single conditional statement allocates the next fence
+            # generation. Concurrent activations cannot read the same value
+            # and both win, because the increment happens in the database.
+            session.query(models.AgentChannelHead).filter_by(
+                id=head.id).update(
+                    {'fence': models.AgentChannelHead.fence + 1,
+                     'workflow_epoch': workflow_epoch,
+                     'session_uuid': session_uuid,
+                     'owner_conductor_id': owner_conductor_id,
+                     'owner_incarnation': owner_incarnation,
+                     'updated_at': timeutils.utcnow()},
+                    synchronize_session=False)
+            fence = session.query(models.AgentChannelHead.fence).filter_by(
+                id=head.id).scalar()
+
+            # The superseded sessions keep their journal rows; only their
+            # work authority ends.
+            session.query(models.AgentChannelSession).filter(
+                models.AgentChannelSession.node_id == node_id,
+                models.AgentChannelSession.uuid != session_uuid,
+                models.AgentChannelSession.state
+                == AGENT_CHANNEL_SESSION_ACTIVE).update(
+                    {'state': AGENT_CHANNEL_SESSION_DRAINING,
+                     'updated_at': timeutils.utcnow()},
+                    synchronize_session=False)
+
+            ref = models.AgentChannelSession(
+                uuid=session_uuid,
+                node_id=node_id,
+                execution_id=execution_id,
+                workflow_epoch=workflow_epoch,
+                fence=fence,
+                owner_conductor_id=owner_conductor_id,
+                owner_incarnation=owner_incarnation,
+                token_verifier=token_verifier,
+                profile=profile,
+                state=AGENT_CHANNEL_SESSION_ACTIVE,
+                next_sequence=0)
+            session.add(ref)
+            session.flush()
+            return _agent_channel_session_dict(ref)
+
+    @wrap_sqlite_retry
+    @oslo_db_api.retry_on_deadlock
+    def publish_agent_command(self, session_uuid, workflow_epoch,
+                              invocation_key, name, params, reply_boundary,
+                              owner_conductor_id, owner_incarnation, fence):
+        canonical = _canonical_agent_channel_params(params)
+        params_sha256 = hashlib.sha256(
+            canonical.encode('utf-8')).hexdigest()
+        # Store a normalized copy so that a caller mutating its input cannot
+        # change the frozen body or its digest.
+        stored_params = json.loads(canonical)
+
+        with _session_for_write() as session:
+            ref = (session.query(models.AgentChannelSession)
+                   .filter_by(uuid=session_uuid)
+                   .one_or_none())
+            if ref is None:
+                raise exception.NotFound(
+                    _('Agent channel session %s could not be found.')
+                    % session_uuid)
+
+            head = (session.query(models.AgentChannelHead)
+                    .filter_by(node_id=ref.node_id)
+                    .one_or_none())
+            if (head is None
+                    or head.session_uuid != session_uuid
+                    or head.fence != fence
+                    or head.workflow_epoch != workflow_epoch
+                    or ref.workflow_epoch != workflow_epoch):
+                raise exception.AgentChannelFenceConflict(
+                    session=session_uuid, fence=fence)
+
+            existing = _find_agent_channel_command(
+                session, session_uuid, workflow_epoch, invocation_key)
+            if existing is not None:
+                return _replay_agent_channel_command(
+                    existing, params_sha256, name, reply_boundary)
+
+            session.query(models.AgentChannelSession).filter_by(
+                uuid=session_uuid).update(
+                    {'next_sequence': models.AgentChannelSession.next_sequence
+                     + 1,
+                     'updated_at': timeutils.utcnow()},
+                    synchronize_session=False)
+            sequence = session.query(
+                models.AgentChannelSession.next_sequence).filter_by(
+                    uuid=session_uuid).scalar()
+
+            command = models.AgentChannelCommand(
+                uuid=uuidutils.generate_uuid(),
+                session_uuid=session_uuid,
+                workflow_epoch=workflow_epoch,
+                invocation_key=invocation_key,
+                sequence=sequence,
+                name=name,
+                params=stored_params,
+                reply_boundary=reply_boundary,
+                params_sha256=params_sha256,
+                state=AGENT_CHANNEL_COMMAND_QUEUED)
+            try:
+                with session.begin_nested():
+                    session.add(command)
+                    session.flush()
+            except db_exc.DBDuplicateEntry:
+                # A concurrent publisher won the identity constraint between
+                # our lookup and our insert. The stored body is authoritative.
+                existing = _find_agent_channel_command(
+                    session, session_uuid, workflow_epoch, invocation_key)
+                if existing is None:
+                    raise
+                return _replay_agent_channel_command(
+                    existing, params_sha256, name, reply_boundary)
+            return _agent_channel_command_dict(command)
+
+    def get_agent_channel_command(self, command_uuid):
+        with _session_for_read() as session:
+            ref = (session.query(models.AgentChannelCommand)
+                   .filter_by(uuid=command_uuid)
+                   .one_or_none())
+            if ref is None:
+                raise exception.NotFound(
+                    _('Agent channel command %s could not be found.')
+                    % command_uuid)
+            return _agent_channel_command_dict(ref)
