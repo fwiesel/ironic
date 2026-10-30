@@ -666,6 +666,98 @@ class InspectionRule(Base):
                      nullable=False)
 
 
+class AgentChannelHead(Base):
+    """Journal head that owns the agent channel of one node.
+
+    The head is the per-node authority record. Its ``fence`` generation is
+    bumped by every activation, so a publisher must present the current
+    generation to keep work authority. The head is never deleted with a
+    session; superseded sessions keep their rows.
+    """
+
+    __tablename__ = 'agent_channel_heads'
+    __table_args__ = (
+        schema.UniqueConstraint('node_id',
+                                name='uniq_agent_channel_heads0node_id'),
+        table_args())
+    id = Column(Integer, primary_key=True)
+    node_id = Column(Integer, ForeignKey('nodes.id'), nullable=False)
+    workflow_epoch = Column(Integer, nullable=False, default=0)
+    session_uuid = Column(String(36), nullable=True)
+    owner_conductor_id = Column(Integer, ForeignKey('conductors.id'),
+                                nullable=True)
+    owner_incarnation = Column(String(255), nullable=True)
+    fence = Column(Integer, nullable=False, default=0)
+
+
+class AgentChannelSession(Base):
+    """One agent execution process on one node.
+
+    A session is unique per ``(node, execution_id)``. Re-activating the same
+    execution process is idempotent. A new execution process supersedes the
+    previous session and raises the node's fence generation.
+    """
+
+    __tablename__ = 'agent_channel_sessions'
+    __table_args__ = (
+        schema.UniqueConstraint('uuid',
+                                name='uniq_agent_channel_sessions0uuid'),
+        schema.UniqueConstraint('node_id', 'execution_id',
+                                name='uniq_agent_channel_sessions0node_exec'),
+        Index('agent_channel_sessions_node_idx', 'node_id'),
+        table_args())
+    id = Column(Integer, primary_key=True)
+    uuid = Column(String(36), nullable=False)
+    node_id = Column(Integer, ForeignKey('nodes.id'), nullable=False)
+    execution_id = Column(String(36), nullable=False)
+    workflow_epoch = Column(Integer, nullable=False)
+    fence = Column(Integer, nullable=False)
+    owner_conductor_id = Column(Integer, ForeignKey('conductors.id'),
+                                nullable=True)
+    owner_incarnation = Column(String(255), nullable=True)
+    # NOTE: This is the verifier of the agent token, never the token itself.
+    token_verifier = Column(String(255), nullable=False)
+    profile = Column(String(255), nullable=False)
+    state = Column(String(16), nullable=False, default='active')
+    # Monotonic per-session command sequence allocator. It is advanced with a
+    # conditional update so that concurrent publishers cannot reuse a value.
+    next_sequence = Column(Integer, nullable=False, default=0)
+
+
+class AgentChannelCommand(Base):
+    """One frozen agent method invocation in a session.
+
+    The command identity is ``(session, workflow_epoch, invocation_key)``.
+    The name, parameters, and reply boundary are immutable once published.
+    """
+
+    __tablename__ = 'agent_channel_commands'
+    __table_args__ = (
+        schema.UniqueConstraint('uuid',
+                                name='uniq_agent_channel_commands0uuid'),
+        schema.UniqueConstraint('session_uuid', 'workflow_epoch',
+                                'invocation_key',
+                                name='uniq_agent_channel_commands0identity'),
+        schema.UniqueConstraint('session_uuid', 'sequence',
+                                name='uniq_agent_channel_commands0sequence'),
+        Index('agent_channel_commands_session_idx', 'session_uuid'),
+        table_args())
+    id = Column(Integer, primary_key=True)
+    uuid = Column(String(36), nullable=False)
+    session_uuid = Column(String(36),
+                          ForeignKey('agent_channel_sessions.uuid'),
+                          nullable=False)
+    workflow_epoch = Column(Integer, nullable=False)
+    invocation_key = Column(String(255), nullable=False)
+    sequence = Column(Integer, nullable=False)
+    name = Column(String(255), nullable=False)
+    params = Column(db_types.JsonEncodedDict(mysql_as_long=True),
+                    nullable=False)
+    reply_boundary = Column(String(32), nullable=False)
+    params_sha256 = Column(String(64), nullable=False)
+    state = Column(String(16), nullable=False, default='queued')
+
+
 def get_class(model_name):
     """Returns the model class with the specified name.
 
