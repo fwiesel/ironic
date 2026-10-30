@@ -733,6 +733,9 @@ expected_object_fingerprints = {
     'InspectionRule': '1.1-6ee14959b85a90a13f3c7b48c53522c7',
     'InspectionRuleCRUDNotification': '1.0-59acc533c11d306f149846f922739c15',
     'InspectionRuleCRUDPayload': '1.0-85d1cf2105308534a630299a897bf562',
+    'AgentChannelHead': '1.0-9cc7ba318e65d7f894599bdacca70650',
+    'AgentChannelSession': '1.0-3604b79e2177cae5d1f42c3240f58809',
+    'AgentChannelCommand': '1.0-168139872d0c43d2431df269ccc296f0',
 }
 
 
