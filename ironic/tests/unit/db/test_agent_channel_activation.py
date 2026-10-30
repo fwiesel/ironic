@@ -133,6 +133,7 @@ class AgentChannelActivationTestCase(base.DbTestCase):
 
         with mock.patch.object(sqlalchemy_api,
                                '_find_agent_channel_command',
+                               autospec=True,
                                side_effect=lookup):
             second = self._publish(session)
         self.assertEqual(first['uuid'], second['uuid'])
