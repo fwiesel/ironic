@@ -1878,6 +1878,30 @@ class Connection(object, metaclass=abc.ABCMeta):
         """
 
     @abc.abstractmethod
+    def report_agent_channel_batch(self, node_uuid, agent_token, reports):
+        """Ingest reports bound to their stored commands and sessions.
+
+        The reports route names only the node. The presented token must
+        authenticate the node credential for an empty batch or an entry
+        whose command is unknown. For a known command, the stored command's
+        session must also authenticate the same token. The route no longer
+        selects one arbitrary session of the node. Each entry must be a
+        JSON object with a string command ID and a JSON object payload.
+        All entries are validated before command lookup or the first
+        mutation. The whole batch commits or rolls back in one transaction.
+
+        :param node_uuid: UUID of the node the agent runs on.
+        :param agent_token: The token presented in X-Ironic-Agent-Token.
+        :param reports: Bounded list of report entry dicts.
+        :returns: A list of acknowledgment dicts.
+        :raises: NodeNotFound if the node does not exist.
+        :raises: AgentChannelUnauthorized if the token does not
+                 authenticate the node.
+        :raises: InvalidParameterValue if the list, an entry object, a
+                 command ID type, or an entry payload is invalid.
+        """
+
+    @abc.abstractmethod
     def poll_agent_channel_work(self, node_uuid, session_uuid, execution_id,
                                 workflow_epoch):
         """Resolve one agent work poll against the journal. Read-only.
@@ -1899,5 +1923,43 @@ class Connection(object, metaclass=abc.ABCMeta):
         :param workflow_epoch: Workflow epoch the poller believes is current.
         :returns: A poll result dict with the keys ``outcome``, ``state``,
                   ``epoch``, ``command``, and ``retry_after``.
+        :raises: NodeNotFound if the node does not exist.
+        """
+
+    @abc.abstractmethod
+    def verify_agent_channel_token(self, node_uuid, session_uuid,
+                                   execution_id, agent_token):
+        """Verify a presented agent token against one named session.
+
+        The wire ``work`` request names its session and execution, so the
+        token authenticates that named pair. The session must belong to
+        the node and must carry the execution identity. The presented
+        token is hashed with SHA256 and compared with the session's stored
+        verifier using a constant-time compare. The verifier itself never
+        leaves the journal and is never returned.
+
+        :param node_uuid: UUID of the node the agent runs on.
+        :param session_uuid: UUID of the session the token must
+                             authenticate.
+        :param execution_id: Stable UUID of one agent execution process.
+        :param agent_token: The token presented in X-Ironic-Agent-Token.
+        :returns: True when the token authenticates the named session.
+        :raises: NodeNotFound if the node does not exist.
+        """
+
+    @abc.abstractmethod
+    def find_agent_channel_session(self, node_uuid, agent_token):
+        """Find the session whose verifier matches the presented token.
+
+        The wire ``reports`` request names only the node: the agent
+        submits a bounded list of entries that carry command IDs, so the
+        reporting session is identified by its token alone. Any session of
+        the node whose stored verifier matches is returned; a superseded
+        session keeps its late-report authority until a later revocation
+        unit fences it.
+
+        :param node_uuid: UUID of the node the agent runs on.
+        :param agent_token: The token presented in X-Ironic-Agent-Token.
+        :returns: The matching session UUID or None.
         :raises: NodeNotFound if the node does not exist.
         """

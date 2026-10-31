@@ -33,6 +33,9 @@ app = {
         '/v1/lookup',
         '/v1/heartbeat/[a-z0-9\\-]+',
         '/v1/continue_inspection',
+        # Agent channel methods authenticate with X-Ironic-Agent-Token
+        '/v1/agent_channel/[a-z0-9\\-]+/work',
+        '/v1/agent_channel/[a-z0-9\\-]+/reports',
     ],
 }
 

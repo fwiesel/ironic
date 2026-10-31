@@ -18,6 +18,7 @@ import collections
 import datetime
 import functools
 import hashlib
+import hmac
 import json
 import logging
 import math
@@ -292,6 +293,83 @@ def _ingest_agent_channel_report(session, session_uuid, entry):
     else:
         ack['disposition'] = AGENT_CHANNEL_ACK_CONFLICT
     return ack
+
+
+def _agent_channel_token_digest(agent_token):
+    if agent_token is None:
+        return None
+    return hashlib.sha256(agent_token.encode('utf-8')).hexdigest()
+
+
+def _agent_channel_node_authenticates(session, node_id, digest):
+    """True when any session of the node carries the token verifier."""
+    matched = False
+    refs = (session.query(models.AgentChannelSession)
+            .filter_by(node_id=node_id).all())
+    for ref in refs:
+        if hmac.compare_digest(digest, ref.token_verifier):
+            matched = True
+    return matched
+
+
+def _validate_agent_channel_report_entry(entry):
+    """Reject a structurally invalid report entry before any mutation."""
+    if not isinstance(entry, dict):
+        raise exception.InvalidParameterValue(
+            _('Each agent channel report entry must be a JSON object.'))
+    if not isinstance(entry.get('command_id'), str):
+        raise exception.InvalidParameterValue(
+            _('Agent channel report command IDs must be strings.'))
+    _canonical_agent_channel_json(
+        entry.get('payload'),
+        _('Agent channel report payloads must be a JSON object '
+          'with string keys and JSON values.'))
+
+
+def _ingest_agent_channel_report_bound(session, node_id, digest, entry):
+    """Store one report bound to its stored command and session.
+
+    The entry names a command UUID only. The command row carries the
+    session, the node is the route node, and the session verifier must
+    match the presented token. A command of another node or another
+    credential is not distinguishable from an unknown command.
+    """
+    command_id = entry.get('command_id')
+    kind = entry.get('kind')
+    ack = {'command_id': command_id, 'kind': kind}
+
+    if kind not in AGENT_CHANNEL_REPORT_KINDS:
+        ack['disposition'] = AGENT_CHANNEL_ACK_UNSUPPORTED_KIND
+        return ack
+
+    # Bind the entry to its stored command before any slot write. The
+    # locking read is a current read, and populate_existing refreshes a row
+    # that an earlier query in this transaction already loaded, so the
+    # command and the session it names come from the latest committed
+    # state. A plain read can answer from a snapshot that the transaction
+    # took before a concurrent reporter committed.
+    command = (session.query(models.AgentChannelCommand)
+               .filter_by(uuid=command_id)
+               .populate_existing()
+               .with_for_update()
+               .one_or_none())
+    if command is None:
+        ack['disposition'] = AGENT_CHANNEL_ACK_UNKNOWN_COMMAND
+        return ack
+
+    owner = (session.query(models.AgentChannelSession)
+             .filter_by(uuid=command.session_uuid)
+             .one_or_none())
+    if (owner is None or owner.node_id != node_id
+            or not hmac.compare_digest(digest, owner.token_verifier)):
+        ack['disposition'] = AGENT_CHANNEL_ACK_UNKNOWN_COMMAND
+        return ack
+
+    # The shared ingest owns the epoch check and the single conditional
+    # slot write, so the bound path cannot bypass the locked read or
+    # duplicate the payload write. The node, command, and session binding
+    # above stays here.
+    return _ingest_agent_channel_report(session, command.session_uuid, entry)
 
 
 def _agent_channel_session_dict(ref):
@@ -4004,6 +4082,44 @@ class Connection(api.Connection):
                                                          entry))
         return acks
 
+    @wrap_sqlite_retry
+    @oslo_db_api.retry_on_deadlock
+    def report_agent_channel_batch(self, node_uuid, agent_token, reports):
+        """Ingest reports bound to their stored commands and sessions.
+
+        The reports route names only the node. The token authenticates the
+        node credential for an empty or unknown batch; for a known command
+        the stored command's session must also authenticate the same token.
+        Each entry must be a JSON object with a string command ID and a
+        JSON object payload. All entries are validated before command lookup
+        or the first mutation. The whole batch commits or rolls back in one
+        transaction.
+        """
+        if not isinstance(reports, list):
+            raise exception.InvalidParameterValue(
+                _('Agent channel reports must be a bounded list.'))
+        if len(reports) > AGENT_CHANNEL_REPORT_MAX_ENTRIES:
+            raise exception.InvalidParameterValue(
+                _('Agent channel report list exceeds the allowed bound of '
+                  '%d entries.') % AGENT_CHANNEL_REPORT_MAX_ENTRIES)
+
+        digest = _agent_channel_token_digest(agent_token)
+        if digest is None:
+            raise exception.AgentChannelUnauthorized()
+
+        acks = []
+        with _session_for_write() as session:
+            node_id = _agent_channel_node_id(session, node_uuid)
+            if not _agent_channel_node_authenticates(session, node_id,
+                                                     digest):
+                raise exception.AgentChannelUnauthorized()
+            for entry in reports:
+                _validate_agent_channel_report_entry(entry)
+            for entry in reports:
+                acks.append(_ingest_agent_channel_report_bound(
+                    session, node_id, digest, entry))
+        return acks
+
     def poll_agent_channel_work(self, node_uuid, session_uuid, execution_id,
                                 workflow_epoch):
         """Resolve one agent work poll against the journal. Read-only.
@@ -4081,3 +4197,46 @@ class Connection(api.Connection):
             return _agent_channel_work_response(
                 AGENT_CHANNEL_OUTCOME_COMMAND, ref.state, epoch,
                 _agent_channel_envelope(command, ref))
+
+    def verify_agent_channel_token(self, node_uuid, session_uuid,
+                                   execution_id, agent_token):
+        """Verify a presented agent token against one named session.
+
+        The session must exist for the node and must carry the execution
+        identity. The presented token is hashed with SHA256 and compared
+        with the session's stored verifier using a constant-time compare,
+        so a rejected token cannot be distinguished by timing. The
+        verifier never leaves the journal.
+        """
+        if agent_token is None:
+            return False
+        digest = hashlib.sha256(agent_token.encode('utf-8')).hexdigest()
+        with _session_for_read() as session:
+            node_id = _agent_channel_node_id(session, node_uuid)
+            ref = (session.query(models.AgentChannelSession)
+                   .filter_by(uuid=session_uuid)
+                   .one_or_none())
+            if (ref is None or ref.node_id != node_id
+                    or ref.execution_id != execution_id):
+                return False
+            return hmac.compare_digest(digest, ref.token_verifier)
+
+    def find_agent_channel_session(self, node_uuid, agent_token):
+        """Find the session of the node whose verifier matches the token.
+
+        The reports endpoint names only the node; the session of the
+        reporter is identified by its token. Every session of the node is
+        a candidate: a superseded session keeps its late-report authority
+        until the revocation unit fences it.
+        """
+        if agent_token is None:
+            return None
+        digest = hashlib.sha256(agent_token.encode('utf-8')).hexdigest()
+        with _session_for_read() as session:
+            node_id = _agent_channel_node_id(session, node_uuid)
+            refs = (session.query(models.AgentChannelSession)
+                    .filter_by(node_id=node_id).all())
+            for ref in refs:
+                if hmac.compare_digest(digest, ref.token_verifier):
+                    return ref.uuid
+            return None

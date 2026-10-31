@@ -178,6 +178,14 @@ class AgentChannelFenceConflict(Conflict):
                  "publisher holds no work authority.")
 
 
+class AgentChannelUnauthorized(IronicException):
+    # NOTE: The message must never name the node or the session. A rejected
+    # token reveals nothing about which journals exist.
+    code = http_client.UNAUTHORIZED
+    _msg_fmt = _("The presented agent token does not authenticate the agent "
+                 "channel.")
+
+
 class NodeAlreadyExists(Conflict):
     _msg_fmt = _("A node with UUID %(uuid)s already exists.")
 
