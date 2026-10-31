@@ -1881,3 +1881,28 @@ class Connection(object, metaclass=abc.ABCMeta):
         :raises: InvalidParameterValue if the list is not a bounded list
                  or an entry payload is not JSON.
         """
+
+    @abc.abstractmethod
+    def poll_agent_channel_work(self, node_uuid, session_uuid, execution_id,
+                                workflow_epoch):
+        """Resolve one agent work poll against the journal. Read-only.
+
+        Returns the session execution epoch, the session state, and one
+        outcome: ``command``, ``no_work``, ``not_ready``, or ``closed``. A
+        ``command`` outcome carries the envelope of the oldest queued
+        command of the session that has no stored receipt. The poll never
+        consumes a command, never advances the workflow, never mutates the
+        head or the session, and never touches the Node row. A superseded
+        session reads state ``draining`` and gets ``no_work``; a stale
+        epoch gets ``no_work`` with the current epoch; an unknown session,
+        a session of another node, a mismatched execution identity, and a
+        node without a channel get ``not_ready``.
+
+        :param node_uuid: UUID of the node whose channel is polled.
+        :param session_uuid: UUID of the polling session.
+        :param execution_id: Stable UUID of one agent execution process.
+        :param workflow_epoch: Workflow epoch the poller believes is current.
+        :returns: A poll result dict with the keys ``outcome``, ``state``,
+                  ``epoch``, ``command``, and ``retry_after``.
+        :raises: NodeNotFound if the node does not exist.
+        """
