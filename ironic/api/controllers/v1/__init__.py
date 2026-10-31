@@ -26,6 +26,7 @@ from webob import exc
 from ironic import api
 from ironic.api.controllers import base
 from ironic.api.controllers import link
+from ironic.api.controllers.v1 import agent_channel
 from ironic.api.controllers.v1 import allocation
 from ironic.api.controllers.v1 import chassis
 from ironic.api.controllers.v1 import conductor
@@ -73,6 +74,7 @@ def make_controller_links(name):
 # openapi-compatible kind), we should switch from callables to use of version
 # constants
 VERSIONED_CONTROLLERS = {
+    'agent_channel': utils.allow_agent_channel,
     'portgroups': utils.allow_portgroups,
     'volume': utils.allow_volume,
     'lookup': utils.allow_ramdisk_endpoints,
@@ -124,6 +126,7 @@ class Controller(object):
     """Version 1 API controller root."""
 
     _subcontroller_map = {
+        'agent_channel': agent_channel.AgentChannelController(),
         'nodes': node.NodesController(),
         'ports': port.PortsController(),
         'portgroups': portgroup.PortgroupsController(),

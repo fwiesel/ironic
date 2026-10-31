@@ -18,6 +18,7 @@ import collections
 import datetime
 import functools
 import hashlib
+import hmac
 import json
 import logging
 import math
@@ -4056,3 +4057,52 @@ class Connection(api.Connection):
             return _agent_channel_work_response(
                 AGENT_CHANNEL_OUTCOME_COMMAND, ref.state, epoch,
                 _agent_channel_envelope(command, ref))
+
+    def verify_agent_channel_token(self, node_uuid, session_uuid,
+                                   execution_id, agent_token):
+        """Verify a presented agent token against one named session.
+
+        The session must exist for the node and must carry the execution
+        identity. The presented token is hashed with SHA256 and compared
+        with the session's stored verifier using a constant-time compare,
+        so a rejected token cannot be distinguished by timing. The
+        verifier never leaves the journal.
+        """
+        if agent_token is None:
+            return False
+        digest = hashlib.sha256(agent_token.encode('utf-8')).hexdigest()
+        with _session_for_read() as session:
+            node_id = session.query(models.Node.id).filter(
+                models.Node.uuid == node_uuid).scalar()
+            if node_id is None:
+                raise exception.NodeNotFound(node=node_uuid)
+            ref = (session.query(models.AgentChannelSession)
+                   .filter_by(uuid=session_uuid)
+                   .one_or_none())
+            if (ref is None or ref.node_id != node_id
+                    or ref.execution_id != execution_id):
+                return False
+            return hmac.compare_digest(digest, ref.token_verifier)
+
+    def find_agent_channel_session(self, node_uuid, agent_token):
+        """Find the session of the node whose verifier matches the token.
+
+        The reports endpoint names only the node; the session of the
+        reporter is identified by its token. Every session of the node is
+        a candidate: a superseded session keeps its late-report authority
+        until the revocation unit fences it.
+        """
+        if agent_token is None:
+            return None
+        digest = hashlib.sha256(agent_token.encode('utf-8')).hexdigest()
+        with _session_for_read() as session:
+            node_id = session.query(models.Node.id).filter(
+                models.Node.uuid == node_uuid).scalar()
+            if node_id is None:
+                raise exception.NodeNotFound(node=node_uuid)
+            refs = (session.query(models.AgentChannelSession)
+                    .filter_by(node_id=node_id).all())
+            for ref in refs:
+                if hmac.compare_digest(digest, ref.token_verifier):
+                    return ref.uuid
+            return None
