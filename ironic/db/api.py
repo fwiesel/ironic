@@ -1861,3 +1861,23 @@ class Connection(object, metaclass=abc.ABCMeta):
         :returns: A command dict.
         :raises: NotFound if the command does not exist.
         """
+
+    @abc.abstractmethod
+    def report_agent_channel(self, session_uuid, reports):
+        """Ingest a bounded list of agent reports into the journal.
+
+        Each report entry is a dict with the keys ``command_id``,
+        ``workflow_epoch``, ``kind``, and ``payload``. The valid kinds are
+        ``receipt``, ``acceptance``, and ``result``. The journal stores the
+        payload in the command's report slot of that kind and returns one
+        acknowledgment dict per entry with ``command_id``, ``kind``, and
+        ``disposition``. Ingestion makes no Node update and no workflow
+        advance.
+
+        :param session_uuid: UUID of the reporting session.
+        :param reports: Bounded list of report entry dicts.
+        :returns: A list of acknowledgment dicts.
+        :raises: NotFound if the session does not exist.
+        :raises: InvalidParameterValue if the list is not a bounded list
+                 or an entry payload is not JSON.
+        """

@@ -79,7 +79,8 @@ class AgentChannelCommand(base.IronicObject,
     """One frozen agent method invocation in a session."""
 
     # Version 1.0: Initial version
-    VERSION = '1.0'
+    # Version 1.1: Added the receipt, acceptance, and result report slots
+    VERSION = '1.1'
 
     fields = {
         'id': object_fields.IntegerField(),
@@ -93,4 +94,7 @@ class AgentChannelCommand(base.IronicObject,
         'reply_boundary': object_fields.StringField(nullable=False),
         'params_sha256': object_fields.StringField(nullable=False),
         'state': object_fields.StringField(nullable=False),
+        'receipt': object_fields.FlexibleDictField(nullable=True),
+        'acceptance': object_fields.FlexibleDictField(nullable=True),
+        'result': object_fields.FlexibleDictField(nullable=True),
     }

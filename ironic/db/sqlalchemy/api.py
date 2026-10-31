@@ -118,6 +118,19 @@ def get_backend():
 AGENT_CHANNEL_SESSION_ACTIVE = 'active'
 AGENT_CHANNEL_SESSION_DRAINING = 'draining'
 AGENT_CHANNEL_COMMAND_QUEUED = 'queued'
+AGENT_CHANNEL_REPORT_KINDS = ('receipt', 'acceptance', 'result')
+# The wire protocol reports are an independent bounded list. The journal
+# guards its own bound so a single oversized batch cannot exhaust the
+# report transaction.
+AGENT_CHANNEL_REPORT_MAX_ENTRIES = 200
+
+# Report slot dispositions returned by the journal DB API.
+AGENT_CHANNEL_ACK_ACKNOWLEDGED = 'acknowledged'
+AGENT_CHANNEL_ACK_DUPLICATE = 'duplicate'
+AGENT_CHANNEL_ACK_CONFLICT = 'conflict'
+AGENT_CHANNEL_ACK_WRONG_EPOCH = 'wrong_epoch'
+AGENT_CHANNEL_ACK_UNKNOWN_COMMAND = 'unknown_command'
+AGENT_CHANNEL_ACK_UNSUPPORTED_KIND = 'unsupported_kind'
 
 # The journal accepts only JSON values as command parameters. Keep the
 # validation and the canonical form in one place so that the stored digest
@@ -169,6 +182,22 @@ def _canonical_agent_channel_params(params):
               'with string keys and JSON values.'))
 
 
+def _canonical_agent_channel_payload(payload):
+    """Validate a report payload and return its canonical JSON form."""
+    if not isinstance(payload, dict):
+        raise exception.InvalidParameterValue(
+            _('Agent channel report payloads must be a JSON object '
+              'with string keys and JSON values.'))
+    _validate_agent_channel_json(payload)
+    try:
+        return json.dumps(payload, sort_keys=True, separators=(',', ':'),
+                          allow_nan=False)
+    except (TypeError, ValueError):
+        raise exception.InvalidParameterValue(
+            _('Agent channel report payloads must be a JSON object '
+              'with string keys and JSON values.'))
+
+
 def _find_agent_channel_command(session, session_uuid, workflow_epoch,
                                 invocation_key):
     return (session.query(models.AgentChannelCommand)
@@ -203,7 +232,57 @@ def _agent_channel_command_dict(ref):
         'reply_boundary': ref.reply_boundary,
         'params_sha256': ref.params_sha256,
         'state': ref.state,
+        'receipt': ref.receipt,
+        'acceptance': ref.acceptance,
+        'result': ref.result,
     }
+
+
+def _ingest_agent_channel_report(session, session_uuid, entry):
+    """Store one agent channel report and return its acknowledgment.
+
+    The acknowledgment carries only the command ID, the report kind, and a
+    disposition. It never carries the payload, so a rejected report cannot
+    leak its values.
+
+    A changed payload for an already committed kind leaves the stored
+    payload untouched: the journal never acknowledges a command and then
+    discards or mutates its stored body.
+    """
+    if not isinstance(entry, dict):
+        raise exception.InvalidParameterValue(
+            _('Each agent channel report entry must be a JSON object.'))
+    command_id = entry.get('command_id')
+    workflow_epoch = entry.get('workflow_epoch')
+    kind = entry.get('kind')
+    ack = {'command_id': command_id, 'kind': kind}
+
+    if kind not in AGENT_CHANNEL_REPORT_KINDS:
+        ack['disposition'] = AGENT_CHANNEL_ACK_UNSUPPORTED_KIND
+        return ack
+
+    command = (session.query(models.AgentChannelCommand)
+               .filter_by(uuid=command_id, session_uuid=session_uuid)
+               .one_or_none())
+    if command is None:
+        ack['disposition'] = AGENT_CHANNEL_ACK_UNKNOWN_COMMAND
+        return ack
+
+    if workflow_epoch != command.workflow_epoch:
+        ack['disposition'] = AGENT_CHANNEL_ACK_WRONG_EPOCH
+        return ack
+
+    canonical = _canonical_agent_channel_payload(entry.get('payload'))
+    slot = getattr(command, kind)
+    if slot is None:
+        setattr(command, kind, json.loads(canonical))
+        ack['disposition'] = AGENT_CHANNEL_ACK_ACKNOWLEDGED
+    elif json.dumps(slot, sort_keys=True,
+                    separators=(',', ':')) == canonical:
+        ack['disposition'] = AGENT_CHANNEL_ACK_DUPLICATE
+    else:
+        ack['disposition'] = AGENT_CHANNEL_ACK_CONFLICT
+    return ack
 
 
 def _agent_channel_session_dict(ref):
@@ -3777,3 +3856,43 @@ class Connection(api.Connection):
                     _('Agent channel command %s could not be found.')
                     % command_uuid)
             return _agent_channel_command_dict(ref)
+
+    @wrap_sqlite_retry
+    @oslo_db_api.retry_on_deadlock
+    def report_agent_channel(self, session_uuid, reports):
+        """Ingest a bounded list of agent reports into the journal.
+
+        Each report entry is a dict with ``command_id``, ``workflow_epoch``,
+        ``kind``, and ``payload``. The payload must be a JSON object, the
+        same shape the journal requires for command parameters. The journal
+        stores the payload in the command's report slot of that kind and
+        returns one acknowledgment dict per entry.
+
+        Ingestion is the reply path: it makes no Node update and no workflow
+        advance. A late report for a stored command of a superseded session
+        is still acknowledged; the command row carries its session, so no
+        session-state check gates the acknowledgment.
+        """
+        if not isinstance(reports, list):
+            raise exception.InvalidParameterValue(
+                _('Agent channel reports must be a bounded list.'))
+        if len(reports) > AGENT_CHANNEL_REPORT_MAX_ENTRIES:
+            raise exception.InvalidParameterValue(
+                _('Agent channel report list exceeds the allowed bound of '
+                  '%d entries.') % AGENT_CHANNEL_REPORT_MAX_ENTRIES)
+
+        acks = []
+        with _session_for_write() as session:
+            ref = (session.query(models.AgentChannelSession)
+                   .filter_by(uuid=session_uuid)
+                   .one_or_none())
+            if ref is None:
+                raise exception.NotFound(
+                    _('Agent channel session %s could not be found.')
+                    % session_uuid)
+
+            for entry in reports:
+                acks.append(_ingest_agent_channel_report(session,
+                                                         session_uuid,
+                                                         entry))
+        return acks
