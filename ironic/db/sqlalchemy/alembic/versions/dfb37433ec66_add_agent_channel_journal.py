@@ -99,18 +99,6 @@ def upgrade():
         sa.Column('reply_boundary', sa.String(length=32), nullable=False),
         sa.Column('params_sha256', sa.String(length=64), nullable=False),
         sa.Column('state', sa.String(length=16), nullable=False),
-        # Report slots of the command. The base JSON type keeps a missing
-        # slot as NULL (the type parameter is None), so absent and stored
-        # stay distinguishable.
-        sa.Column('receipt',
-                  db_types.JsonEncodedType(mysql_as_long=True).impl,
-                  nullable=True),
-        sa.Column('acceptance',
-                  db_types.JsonEncodedType(mysql_as_long=True).impl,
-                  nullable=True),
-        sa.Column('result',
-                  db_types.JsonEncodedType(mysql_as_long=True).impl,
-                  nullable=True),
         sa.PrimaryKeyConstraint('id'),
         sa.ForeignKeyConstraint(['session_uuid'],
                                 ['agent_channel_sessions.uuid']),
