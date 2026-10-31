@@ -1538,6 +1538,20 @@ utility_policies = [
         description='Receive inspection data from the ramdisk',
         operations=[{'path': '/continue_inspection', 'method': 'POST'}],
     ),
+    policy.DocumentedRuleDefault(
+        name='baremetal:node:agent_channel:work',
+        check_str='',
+        description='Receive agent channel work polls from IPA ramdisk',
+        operations=[{'path': '/agent_channel/{node_uuid}/work',
+                     'method': 'POST'}],
+    ),
+    policy.DocumentedRuleDefault(
+        name='baremetal:node:agent_channel:reports',
+        check_str='',
+        description='Receive agent channel reports from IPA ramdisk',
+        operations=[{'path': '/agent_channel/{node_uuid}/reports',
+                     'method': 'POST'}],
+    ),
 ]
 
 
