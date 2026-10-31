@@ -117,7 +117,29 @@ def get_backend():
 
 AGENT_CHANNEL_SESSION_ACTIVE = 'active'
 AGENT_CHANNEL_SESSION_DRAINING = 'draining'
+AGENT_CHANNEL_SESSION_CLOSING = 'closing'
+AGENT_CHANNEL_SESSION_CLOSED = 'closed'
 AGENT_CHANNEL_COMMAND_QUEUED = 'queued'
+AGENT_CHANNEL_REPORT_KINDS = ('receipt', 'acceptance', 'result')
+# The wire protocol reports are an independent bounded list. The journal
+# guards its own bound so a single oversized batch cannot exhaust the
+# report transaction.
+AGENT_CHANNEL_REPORT_MAX_ENTRIES = 200
+
+# Work poll outcomes of the wire protocol. A poll carries exactly one
+# outcome: a command envelope, no work, a channel that is not ready for
+# the poller, or a closed session.
+AGENT_CHANNEL_OUTCOME_COMMAND = 'command'
+AGENT_CHANNEL_OUTCOME_NO_WORK = 'no_work'
+AGENT_CHANNEL_OUTCOME_NOT_READY = 'not_ready'
+AGENT_CHANNEL_OUTCOME_CLOSED = 'closed'
+
+AGENT_CHANNEL_ACK_ACKNOWLEDGED = 'acknowledged'
+AGENT_CHANNEL_ACK_DUPLICATE = 'duplicate'
+AGENT_CHANNEL_ACK_CONFLICT = 'conflict'
+AGENT_CHANNEL_ACK_WRONG_EPOCH = 'wrong_epoch'
+AGENT_CHANNEL_ACK_UNKNOWN_COMMAND = 'unknown_command'
+AGENT_CHANNEL_ACK_UNSUPPORTED_KIND = 'unsupported_kind'
 
 # The journal accepts only JSON values as command parameters. Keep the
 # validation and the canonical form in one place so that the stored digest
@@ -168,6 +190,21 @@ def _canonical_agent_channel_params(params):
               'with string keys and JSON values.'))
 
 
+def _canonical_agent_channel_payload(payload):
+    if not isinstance(payload, dict):
+        raise exception.InvalidParameterValue(
+            _('Agent channel report payloads must be a JSON object '
+              'with string keys and JSON values.'))
+    _validate_agent_channel_json(payload)
+    try:
+        return json.dumps(payload, sort_keys=True, separators=(',', ':'),
+                          allow_nan=False)
+    except (TypeError, ValueError):
+        raise exception.InvalidParameterValue(
+            _('Agent channel report payloads must be a JSON object '
+              'with string keys and JSON values.'))
+
+
 def _find_agent_channel_command(session, session_uuid, workflow_epoch,
                                 invocation_key):
     return (session.query(models.AgentChannelCommand)
@@ -202,7 +239,57 @@ def _agent_channel_command_dict(ref):
         'reply_boundary': ref.reply_boundary,
         'params_sha256': ref.params_sha256,
         'state': ref.state,
+        'receipt': ref.receipt,
+        'acceptance': ref.acceptance,
+        'result': ref.result,
     }
+
+
+def _ingest_agent_channel_report(session, session_uuid, entry):
+    """Store one agent channel report and return its acknowledgment.
+
+    The acknowledgment carries only the command ID, the report kind, and a
+    disposition. It never carries the payload, so a rejected report cannot
+    leak its values.
+
+    A changed payload for an already committed kind leaves the stored
+    payload untouched: the journal never acknowledges a command and then
+    discards or mutates its stored body.
+    """
+    if not isinstance(entry, dict):
+        raise exception.InvalidParameterValue(
+            _('Each agent channel report entry must be a JSON object.'))
+    command_id = entry.get('command_id')
+    workflow_epoch = entry.get('workflow_epoch')
+    kind = entry.get('kind')
+    ack = {'command_id': command_id, 'kind': kind}
+
+    if kind not in AGENT_CHANNEL_REPORT_KINDS:
+        ack['disposition'] = AGENT_CHANNEL_ACK_UNSUPPORTED_KIND
+        return ack
+
+    command = (session.query(models.AgentChannelCommand)
+               .filter_by(uuid=command_id, session_uuid=session_uuid)
+               .one_or_none())
+    if command is None:
+        ack['disposition'] = AGENT_CHANNEL_ACK_UNKNOWN_COMMAND
+        return ack
+
+    if workflow_epoch != command.workflow_epoch:
+        ack['disposition'] = AGENT_CHANNEL_ACK_WRONG_EPOCH
+        return ack
+
+    canonical = _canonical_agent_channel_payload(entry.get('payload'))
+    slot = getattr(command, kind)
+    if slot is None:
+        setattr(command, kind, json.loads(canonical))
+        ack['disposition'] = AGENT_CHANNEL_ACK_ACKNOWLEDGED
+    elif json.dumps(slot, sort_keys=True,
+                    separators=(',', ':')) == canonical:
+        ack['disposition'] = AGENT_CHANNEL_ACK_DUPLICATE
+    else:
+        ack['disposition'] = AGENT_CHANNEL_ACK_CONFLICT
+    return ack
 
 
 def _agent_channel_session_dict(ref):
@@ -217,6 +304,74 @@ def _agent_channel_session_dict(ref):
         'owner_incarnation': ref.owner_incarnation,
         'profile': ref.profile,
         'state': ref.state,
+    }
+
+
+def _agent_channel_envelope(ref, session):
+    """Build the wire envelope of one stored command.
+
+    The envelope carries the command identity, its frozen body, and the
+    stored acceptance and completion report slots. The terminal admission
+    slot belongs to the terminal barrier unit and is not stored yet, so it
+    does not appear here.
+    """
+    return {
+        'uuid': ref.uuid,
+        'session_uuid': ref.session_uuid,
+        'execution_id': session.execution_id,
+        'workflow_epoch': ref.workflow_epoch,
+        'sequence': ref.sequence,
+        'name': ref.name,
+        'params': json.loads(json.dumps(ref.params)),
+        'reply_boundary': ref.reply_boundary,
+        'state': ref.state,
+        'receipt': ref.receipt,
+        'acceptance': ref.acceptance,
+        'result': ref.result,
+    }
+
+
+def _next_agent_channel_command(session, session_uuid):
+    """The oldest queued command of a session that is not yet received.
+
+    A stored receipt is the durable proof that the delivery was accepted. A
+    lost delivery response must stay retrievable until then, so only
+    commands without a stored receipt are delivered. The journal keeps a
+    missing report slot as JSON null, which decodes to ``None``; stored
+    report payloads are always JSON objects, so ``receipt is None`` is
+    exactly the not-yet-received state. Consumption is a later unit and
+    changes the command state, which takes the command out of this query as
+    well.
+    """
+    refs = (session.query(models.AgentChannelCommand)
+            .filter_by(session_uuid=session_uuid,
+                       state=AGENT_CHANNEL_COMMAND_QUEUED)
+            .order_by(models.AgentChannelCommand.sequence.asc())
+            .all())
+    for ref in refs:
+        if ref.receipt is None:
+            return ref
+    return None
+
+
+def _agent_channel_work_response(outcome, state, epoch, command):
+    return {
+        'outcome': outcome,
+        'state': state,
+        'epoch': epoch,
+        'command': command,
+        'retry_after': 0,
+    }
+
+
+def _agent_channel_work_not_ready():
+    """The channel is not ready for this poller; no identity is revealed."""
+    return {
+        'outcome': AGENT_CHANNEL_OUTCOME_NOT_READY,
+        'state': None,
+        'epoch': None,
+        'command': None,
+        'retry_after': 0,
     }
 
 
@@ -3776,3 +3931,124 @@ class Connection(api.Connection):
                     _('Agent channel command %s could not be found.')
                     % command_uuid)
             return _agent_channel_command_dict(ref)
+
+    @wrap_sqlite_retry
+    @oslo_db_api.retry_on_deadlock
+    def report_agent_channel(self, session_uuid, reports):
+        """Ingest a bounded list of agent reports into the journal.
+
+        Each report entry is a dict with ``command_id``, ``workflow_epoch``,
+        ``kind``, and ``payload``. The payload must be a JSON object, the
+        same shape the journal requires for command parameters. The journal
+        stores the payload in the command's report slot of that kind and
+        returns one acknowledgment dict per entry.
+
+        Ingestion is the reply path: it makes no Node update and no workflow
+        advance. A late report for a stored command of a superseded session
+        is still acknowledged; the command row carries its session, so no
+        session-state check gates the acknowledgment.
+        """
+        if not isinstance(reports, list):
+            raise exception.InvalidParameterValue(
+                _('Agent channel reports must be a bounded list.'))
+        if len(reports) > AGENT_CHANNEL_REPORT_MAX_ENTRIES:
+            raise exception.InvalidParameterValue(
+                _('Agent channel report list exceeds the allowed bound of '
+                  '%d entries.') % AGENT_CHANNEL_REPORT_MAX_ENTRIES)
+
+        acks = []
+        with _session_for_write() as session:
+            ref = (session.query(models.AgentChannelSession)
+                   .filter_by(uuid=session_uuid)
+                   .one_or_none())
+            if ref is None:
+                raise exception.NotFound(
+                    _('Agent channel session %s could not be found.')
+                    % session_uuid)
+
+            for entry in reports:
+                acks.append(_ingest_agent_channel_report(session,
+                                                         session_uuid,
+                                                         entry))
+        return acks
+
+    def poll_agent_channel_work(self, node_uuid, session_uuid, execution_id,
+                                workflow_epoch):
+        """Resolve one agent work poll against the journal. Read-only.
+
+        The poll answers the wire ``work`` request at the journal boundary:
+        it returns the session execution epoch, the session state, and
+        exactly one outcome (``command``, ``no_work``, ``not_ready``, or
+        ``closed``). A ``command`` outcome carries the wire envelope of the
+        oldest queued command of the session that has no stored receipt; a
+        lost delivery stays retrievable until the receipt is durable.
+
+        The poll is the delivery side only. It never consumes a command,
+        never advances the workflow epoch, never mutates the head or the
+        session, and never touches the Node row. Fencing rules: a poll
+        whose session is superseded reads state ``draining`` and gets
+        ``no_work``; a stale workflow epoch gets ``no_work`` with the
+        current epoch; an unknown session, a session of another node, a
+        mismatched execution identity, and a node without a channel get
+        ``not_ready`` without revealing any journal identity.
+
+        :param node_uuid: UUID of the node whose channel is polled.
+        :param session_uuid: UUID of the polling session.
+        :param execution_id: Stable UUID of one agent execution process.
+        :param workflow_epoch: Workflow epoch the poller believes is current.
+        :returns: A poll result dict with the keys ``outcome``, ``state``,
+                  ``epoch``, ``command``, and ``retry_after``.
+        :raises: NodeNotFound if the node does not exist.
+        """
+        with _session_for_read() as session:
+            node_id = session.query(models.Node.id).filter(
+                models.Node.uuid == node_uuid).scalar()
+            if node_id is None:
+                raise exception.NodeNotFound(node=node_uuid)
+
+            head = (session.query(models.AgentChannelHead)
+                    .filter_by(node_id=node_id)
+                    .one_or_none())
+            if head is None:
+                return _agent_channel_work_not_ready()
+
+            ref = (session.query(models.AgentChannelSession)
+                   .filter_by(uuid=session_uuid)
+                   .one_or_none())
+            if (ref is None or ref.node_id != node_id
+                    or ref.execution_id != execution_id):
+                return _agent_channel_work_not_ready()
+
+            epoch = head.workflow_epoch
+            if ref.state == AGENT_CHANNEL_SESSION_CLOSED:
+                return _agent_channel_work_response(
+                    AGENT_CHANNEL_OUTCOME_CLOSED, ref.state, epoch, None)
+
+            current = (head.session_uuid == session_uuid
+                       and head.fence == ref.fence
+                       and head.workflow_epoch == ref.workflow_epoch)
+            if not current:
+                # A superseded session reads state draining; its poll is
+                # answered but carries no new work and no consume.
+                return _agent_channel_work_response(
+                    AGENT_CHANNEL_OUTCOME_NO_WORK,
+                    AGENT_CHANNEL_SESSION_DRAINING, epoch, None)
+
+            if ref.state in (AGENT_CHANNEL_SESSION_DRAINING,
+                             AGENT_CHANNEL_SESSION_CLOSING):
+                return _agent_channel_work_response(
+                    AGENT_CHANNEL_OUTCOME_NO_WORK, ref.state, epoch, None)
+
+            if ref.workflow_epoch != workflow_epoch:
+                # A stale poller gets no work; the response carries the
+                # current epoch so it can resynchronize.
+                return _agent_channel_work_response(
+                    AGENT_CHANNEL_OUTCOME_NO_WORK, ref.state, epoch, None)
+
+            command = _next_agent_channel_command(session, session_uuid)
+            if command is None:
+                return _agent_channel_work_response(
+                    AGENT_CHANNEL_OUTCOME_NO_WORK, ref.state, epoch, None)
+            return _agent_channel_work_response(
+                AGENT_CHANNEL_OUTCOME_COMMAND, ref.state, epoch,
+                _agent_channel_envelope(command, ref))

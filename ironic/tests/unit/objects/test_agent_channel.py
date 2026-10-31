@@ -51,10 +51,18 @@ class AgentChannelObjectTestCase(base.TestCase):
                           '%s is not a registered versioned object'
                           % name)
 
-    def test_records_start_at_version_1_0(self):
+    def test_records_have_consistent_versions(self):
+        # The head and session records are new at 1.0. The command record
+        # grew its report slots, so it advanced to 1.1 while the record
+        # family is still unreleased.
+        expect_start = {
+            'AgentChannelHead': '1.0',
+            'AgentChannelSession': '1.0',
+            'AgentChannelCommand': '1.1',
+        }
         for name, (obj_cls, _model) in JOURNAL_RECORDS.items():
-            self.assertEqual('1.0', obj_cls.VERSION,
-                             '%s must start at version 1.0' % name)
+            self.assertEqual(expect_start[name], obj_cls.VERSION,
+                             '%s has an unexpected version' % name)
 
     def test_master_release_mapping_knows_the_records(self):
         objects = release_mappings.RELEASE_MAPPING['master']['objects']
