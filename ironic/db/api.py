@@ -1902,3 +1902,41 @@ class Connection(object, metaclass=abc.ABCMeta):
         :raises: NodeNotFound if the node does not exist.
         """
 
+    @abc.abstractmethod
+    def verify_agent_channel_token(self, node_uuid, session_uuid,
+                                   execution_id, agent_token):
+        """Verify a presented agent token against one named session.
+
+        The wire ``work`` request names its session and execution, so the
+        token authenticates that named pair. The session must belong to
+        the node and must carry the execution identity. The presented
+        token is hashed with SHA256 and compared with the session's stored
+        verifier using a constant-time compare. The verifier itself never
+        leaves the journal and is never returned.
+
+        :param node_uuid: UUID of the node the agent runs on.
+        :param session_uuid: UUID of the session the token must
+                             authenticate.
+        :param execution_id: Stable UUID of one agent execution process.
+        :param agent_token: The token presented in X-Ironic-Agent-Token.
+        :returns: True when the token authenticates the named session.
+        :raises: NodeNotFound if the node does not exist.
+        """
+
+    @abc.abstractmethod
+    def find_agent_channel_session(self, node_uuid, agent_token):
+        """Find the session whose verifier matches the presented token.
+
+        The wire ``reports`` request names only the node: the agent
+        submits a bounded list of entries that carry command IDs, so the
+        reporting session is identified by its token alone. Any session of
+        the node whose stored verifier matches is returned; a superseded
+        session keeps its late-report authority until a later revocation
+        unit fences it.
+
+        :param node_uuid: UUID of the node the agent runs on.
+        :param agent_token: The token presented in X-Ironic-Agent-Token.
+        :returns: The matching session UUID or None.
+        :raises: NodeNotFound if the node does not exist.
+        """
+

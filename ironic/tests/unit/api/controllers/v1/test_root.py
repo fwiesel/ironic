@@ -133,6 +133,12 @@ class TestV1Routing(api_base.BaseApiTest):
                 {'href': 'http://localhost/v1/allocations/', 'rel': 'self'},
                 {'href': 'http://localhost/allocations/', 'rel': 'bookmark'}
             ],
+            'agent_channel': [
+                {'href': 'http://localhost/v1/agent_channel/',
+                 'rel': 'self'},
+                {'href': 'http://localhost/agent_channel/',
+                 'rel': 'bookmark'}
+            ],
             'chassis': [
                 {'href': 'http://localhost/v1/chassis/', 'rel': 'self'},
                 {'href': 'http://localhost/chassis/', 'rel': 'bookmark'}
