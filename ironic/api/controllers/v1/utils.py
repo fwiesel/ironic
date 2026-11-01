@@ -1502,9 +1502,10 @@ def allow_node_history_fields():
 def allow_agent_channel():
     """Check if the agent channel work and reports endpoints are allowed.
 
-    Version 1.116 of the API introduced them.
+    The agent-exchange protocol introduces no new microversion: the
+    endpoints are served from the current API version (1.115).
     """
-    return api.request.version.minor >= versions.MINOR_116_AGENT_CHANNEL
+    return api.request.version.minor >= versions.MINOR_115_NODE_HISTORY_FIELDS
 
 
 def allow_node_inventory():

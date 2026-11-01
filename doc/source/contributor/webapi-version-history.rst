@@ -2,29 +2,6 @@
 REST API Version History
 ========================
 
-1.116 (Hibiscus)
-----------------
-
-Add the agent channel endpoints for the agent-poll transport:
-
-* ``POST /v1/agent_channel/{node_uuid}/work`` — an agent in ``agent-poll``
-  mode requests one bounded piece of work from its session journal. The
-  request body carries the session UUID, the execution UUID, the poller's
-  believed workflow epoch, an opaque poll ID, and a wait budget. The
-  response carries the session execution epoch, its state, one outcome
-  (``command``, ``no_work``, ``not_ready``, or ``closed``), an optional
-  command envelope, and a ``retry_after`` hint.
-* ``POST /v1/agent_channel/{node_uuid}/reports`` — the agent submits an
-  independent bounded list of report entries. Each entry has a command ID,
-  a workflow epoch, a kind (``receipt``, ``acceptance``, ``result``), and a
-  payload. The response commits one acknowledgment per entry with its
-  disposition.
-
-Both routes require the exact node UUID and authenticate the
-``X-Ironic-Agent-Token`` header against the session token verifiers in the
-journal. The token never appears in responses and the verifier never leaves
-the journal.
-
 1.115 (Hibiscus)
 ----------------
 

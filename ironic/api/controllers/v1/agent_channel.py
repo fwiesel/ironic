@@ -29,9 +29,10 @@ wire surface of that transport.
   kind (``receipt``, ``acceptance``, ``result``), and a payload. The
   response commits one acknowledgment per entry with its disposition.
 
-Both routes exist only at microversion 1.116 and later, require the exact
-node UUID in the path, and authenticate the ``X-Ironic-Agent-Token`` header
-against the session token verifiers in the journal. The verifier never
+Both routes are served from the current API version (1.115); they
+introduce no new microversion. They require the exact node UUID in the
+path and authenticate the ``X-Ironic-Agent-Token`` header against the
+session token verifiers in the journal. The verifier never
 leaves the journal, and neither route touches the conductor workflow
 worker: the journal is the authority and these handlers hold no task
 reservation, no conductor lock, and no long transaction. The token never

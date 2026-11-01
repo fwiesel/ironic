@@ -28,7 +28,8 @@ The frozen contract adds two public routes for the deploy ramdisk:
   payload. The response commits one acknowledgment per entry with its
   disposition.
 
-Both routes exist only at microversion 1.116 and later, require the exact
+Both routes are served from the current API version (1.115) and introduce
+no new microversion. They require the exact
 node UUID in the URL, and authenticate the ``X-Ironic-Agent-Token`` header
 against the session token verifiers in the journal. They do not bypass the
 standard policy layer. The agent token never appears in the responses and
@@ -57,8 +58,8 @@ EPOCH = 1
 NAME = 'power_on'
 BOUNDARY = 'completion'
 
-V116 = '1.116'
 V115 = '1.115'
+V114 = '1.114'
 
 
 class AgentChannelApiTestCase(test_api_base.BaseApiTest):
@@ -74,7 +75,7 @@ class AgentChannelApiTestCase(test_api_base.BaseApiTest):
         self.session_uuid = self.session['uuid']
         self.fence = self.session['fence']
 
-    def _headers(self, version=V116, token=TOKEN, extra=None):
+    def _headers(self, version=V115, token=TOKEN, extra=None):
         headers = {
             api_base.Version.string: version,
             TOKEN_HEADER: token,
@@ -123,14 +124,14 @@ class AgentChannelApiTestCase(test_api_base.BaseApiTest):
 
     # -- microversion gating ------------------------------------------------
 
-    def test_work_route_is_hidden_before_116(self):
+    def test_work_route_is_hidden_before_115(self):
         response = self._post_work(
-            self._work_body(), headers=self._headers(version=V115))
+            self._work_body(), headers=self._headers(version=V114))
         self.assertEqual(http_client.NOT_FOUND, response.status_int)
 
-    def test_reports_route_is_hidden_before_116(self):
+    def test_reports_route_is_hidden_before_115(self):
         response = self._post_reports(
-            [], headers=self._headers(version=V115))
+            [], headers=self._headers(version=V114))
         self.assertEqual(http_client.NOT_FOUND, response.status_int)
 
     # -- work endpoint auth -------------------------------------------------
@@ -385,14 +386,14 @@ class AgentChannelApiTestCase(test_api_base.BaseApiTest):
         self.assertNotIn(TOKEN, str(body))
         self.assertNotIn('token', str(body.get('reports', [])))
 
-    def test_agent_channel_not_in_version_index_before_116(self):
+    def test_agent_channel_not_in_version_index_before_115(self):
         data = self.get_json(
-            '/v1', path_prefix='', headers={api_base.Version.string: V115})
+            '/v1', path_prefix='', headers={api_base.Version.string: V114})
         self.assertNotIn('agent_channel', data)
 
-    def test_agent_channel_in_version_index_at_116(self):
+    def test_agent_channel_in_version_index_at_115(self):
         data = self.get_json(
-            '/v1', path_prefix='', headers={api_base.Version.string: V116})
+            '/v1', path_prefix='', headers={api_base.Version.string: V115})
         self.assertIn('agent_channel', data)
 
     def test_reports_do_not_change_the_node_state(self):
