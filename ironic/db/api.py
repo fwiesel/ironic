@@ -1944,3 +1944,79 @@ class Connection(object, metaclass=abc.ABCMeta):
         :returns: The matching session UUID or None.
         :raises: NodeNotFound if the node does not exist.
         """
+
+    @abc.abstractmethod
+    def consume_agent_channel_command(self, node_uuid, session_uuid,
+                                      command_uuid, workflow_epoch, fence):
+        """Consume a stored agent channel reply under the current fence.
+
+        Consumption is the caller side of the rendezvous: a conductor holds
+        the exclusive Node reservation and waits for the correlated result.
+        Once the journal holds a committed result for the command, this
+        operation atomically marks the command consumed in one short write
+        transaction and returns the stored reply so the caller can complete
+        its Node-phase advance under the existing task fence. Consumption
+        is idempotent: a repeated consume of the same command returns the
+        identical stored reply and never advances anything a second time.
+
+        The consume is fenced like publication. A stale session, fence, or
+        epoch receives no consume and no duplicate advance, and a stale
+        caller cannot reach into the journal of another node.
+
+        The consume touches no Node row, needs no Node-row lock, and needs
+        no TaskManager reservation beyond the caller's own.
+
+        :param node_uuid: UUID of the node whose channel is consumed.
+        :param session_uuid: UUID of the session that published the command.
+        :param command_uuid: UUID of the command with the committed reply.
+        :param workflow_epoch: Workflow epoch the caller believes is current.
+        :param fence: Fence generation the caller believes is current.
+        :returns: A dict with ``outcome`` ``reply`` and the consumed command
+                  dict under ``command``. The command dict carries the
+                  stored report slots and ``state`` ``consumed``.
+        :raises: NodeNotFound if the node does not exist.
+        :raises: NotFound if the session or the command does not exist.
+        :raises: AgentChannelFenceConflict if the caller is stale; the
+                 command is then not consumed.
+        :raises: AgentChannelCommandNotReady if the command has no stored
+                 result to consume.
+        """
+
+    @abc.abstractmethod
+    def wait_agent_channel_reply(self, node_uuid, session_uuid, command_uuid,
+                                 workflow_epoch, fence, timeout,
+                                 wake_hint=None, wait_interval=None):
+        """Wait for the committed reply of one command.
+
+        The caller may hold the exclusive Node reservation while it waits.
+        The wait itself holds no Node reservation and no database
+        transaction: every journal read is a separate short read-only
+        transaction, so a concurrent report dispatcher can always commit.
+        The wait uses a monotonic deadline; repeated wake-ups never extend
+        the deadline. Between reads the optional ``wake_hint`` callback is
+        given a chance to deliver a notification hint; lost hints are safe
+        because the durable journal is the authority.
+
+        When the result is committed the wait consumes the command under the
+        presented fence and returns the stored reply. If the session is
+        superseded while the caller waits, the consume is fenced and the
+        wait returns no reply; the stored result remains available to the
+        report-only acknowledgment path.
+
+        :param node_uuid: UUID of the node whose channel is waited on.
+        :param session_uuid: UUID of the session that published the command.
+        :param command_uuid: UUID of the command to wait on.
+        :param workflow_epoch: Workflow epoch the caller believes is current.
+        :param fence: Fence generation the caller believes is current.
+        :param timeout: Maximum seconds to wait under a monotonic deadline.
+        :param wake_hint: Optional zero-argument callable invoked between
+                          journal reads.
+        :param wait_interval: Seconds to rest between reads. An empty value
+                              lets the wake hint drive the loop.
+        :returns: A dict with ``outcome`` ``reply`` and the consumed command
+                  dict, or ``outcome`` ``no_reply`` with no command when the
+                  deadline expired without a committed result or the session
+                  was superseded.
+        :raises: NodeNotFound if the node does not exist at wait start.
+        :raises: NotFound if the session or the command does not exist.
+        """

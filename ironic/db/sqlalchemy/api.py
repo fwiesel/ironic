@@ -23,6 +23,7 @@ import json
 import logging
 import math
 import threading
+import time
 
 from oslo_concurrency import lockutils
 from oslo_db import api as oslo_db_api
@@ -121,6 +122,7 @@ AGENT_CHANNEL_SESSION_DRAINING = 'draining'
 AGENT_CHANNEL_SESSION_CLOSING = 'closing'
 AGENT_CHANNEL_SESSION_CLOSED = 'closed'
 AGENT_CHANNEL_COMMAND_QUEUED = 'queued'
+AGENT_CHANNEL_COMMAND_CONSUMED = 'consumed'
 AGENT_CHANNEL_REPORT_KINDS = ('receipt', 'acceptance', 'result')
 # The wire protocol reports are an independent bounded list. The journal
 # guards its own bound so a single oversized batch cannot exhaust the
@@ -134,6 +136,12 @@ AGENT_CHANNEL_OUTCOME_COMMAND = 'command'
 AGENT_CHANNEL_OUTCOME_NO_WORK = 'no_work'
 AGENT_CHANNEL_OUTCOME_NOT_READY = 'not_ready'
 AGENT_CHANNEL_OUTCOME_CLOSED = 'closed'
+
+# Reply outcomes of the consumption contract. Consumption is the caller
+# side of the rendezvous: it returns the stored reply or states that no
+# reply was committed in time.
+AGENT_CHANNEL_OUTCOME_REPLY = 'reply'
+AGENT_CHANNEL_OUTCOME_NO_REPLY = 'no_reply'
 
 # Report slot dispositions returned by the journal DB API.
 AGENT_CHANNEL_ACK_ACKNOWLEDGED = 'acknowledged'
@@ -377,6 +385,14 @@ def _agent_channel_work_not_ready():
         'epoch': None,
         'command': None,
         'retry_after': 0,
+    }
+
+
+def _agent_channel_reply_response(outcome, command):
+    """Shape of one consumption result: outcome plus the stored command."""
+    return {
+        'outcome': outcome,
+        'command': command,
     }
 
 
@@ -4106,3 +4122,197 @@ class Connection(api.Connection):
                 if hmac.compare_digest(digest, ref.token_verifier):
                     return ref.uuid
             return None
+
+    @wrap_sqlite_retry
+    @oslo_db_api.retry_on_deadlock
+    def consume_agent_channel_command(self, node_uuid, session_uuid,
+                                      command_uuid, workflow_epoch, fence):
+        """Consume a stored agent channel reply under the current fence.
+
+        Consumption is the caller side of the rendezvous: a conductor holds
+        the exclusive Node reservation and waits for the correlated result.
+        Once the journal holds a committed result for the command, this
+        operation atomically marks the command consumed in one short write
+        transaction and returns the stored reply so the caller can complete
+        its Node-phase advance under the existing task fence. It is
+        idempotent: a repeated consume returns the identical stored reply
+        and never advances anything a second time.
+
+        The consume is fenced exactly like publication: a stale session,
+        fence, or epoch receives no consume and no duplicate advance, and a
+        caller of one node cannot reach into the journal of another node.
+        The consume touches no Node row, needs no Node-row lock, and needs
+        no TaskManager reservation beyond the caller's own.
+
+        :param node_uuid: UUID of the node whose channel is consumed.
+        :param session_uuid: UUID of the session that published the command.
+        :param command_uuid: UUID of the command with the committed reply.
+        :param workflow_epoch: Workflow epoch the caller believes is current.
+        :param fence: Fence generation the caller believes is current.
+        :returns: A dict with ``outcome`` ``reply`` and the consumed command
+                  dict under ``command``.
+        :raises: NodeNotFound if the node does not exist.
+        :raises: NotFound if the session or the command does not exist.
+        :raises: AgentChannelFenceConflict if the caller is stale.
+        :raises: AgentChannelCommandNotReady if the command has no stored
+                 result to consume.
+        """
+        with _session_for_write() as session:
+            node_id = session.query(models.Node.id).filter(
+                models.Node.uuid == node_uuid).scalar()
+            if node_id is None:
+                raise exception.NodeNotFound(node=node_uuid)
+
+            ref = (session.query(models.AgentChannelSession)
+                   .filter_by(uuid=session_uuid)
+                   .one_or_none())
+            if ref is None:
+                raise exception.NotFound(
+                    _('Agent channel session %s could not be found.')
+                    % session_uuid)
+
+            head = (session.query(models.AgentChannelHead)
+                    .filter_by(node_id=node_id)
+                    .one_or_none())
+            if (head is None
+                    or head.session_uuid != session_uuid
+                    or head.fence != fence
+                    or head.workflow_epoch != workflow_epoch
+                    or ref.workflow_epoch != workflow_epoch):
+                raise exception.AgentChannelFenceConflict(
+                    session=session_uuid, fence=fence)
+
+            command = (session.query(models.AgentChannelCommand)
+                       .filter_by(uuid=command_uuid,
+                                  session_uuid=session_uuid)
+                       .one_or_none())
+            if command is None:
+                raise exception.NotFound(
+                    _('Agent channel command %s could not be found.')
+                    % command_uuid)
+            if command.workflow_epoch != workflow_epoch:
+                # A caller with a stale epoch cannot consume the command.
+                raise exception.AgentChannelFenceConflict(
+                    session=session_uuid, fence=fence)
+
+            if command.state == AGENT_CHANNEL_COMMAND_CONSUMED:
+                # A retried consume returns the stored reply and the stored
+                # consumption state; nothing advances a second time.
+                return _agent_channel_reply_response(
+                    AGENT_CHANNEL_OUTCOME_REPLY,
+                    _agent_channel_command_dict(command))
+
+            if command.result is None:
+                # There is nothing to advance and nothing to return; the
+                # command stays queued and fetchable.
+                raise exception.AgentChannelCommandNotReady(
+                    command=command_uuid)
+
+            # A single conditional statement makes the queued-to-consumed
+            # transition atomic: a concurrent consumer cannot double-turn it.
+            updated = session.query(models.AgentChannelCommand).filter_by(
+                uuid=command_uuid, session_uuid=session_uuid,
+                state=AGENT_CHANNEL_COMMAND_QUEUED).update(
+                    {'state': AGENT_CHANNEL_COMMAND_CONSUMED,
+                     'updated_at': timeutils.utcnow()},
+                    synchronize_session=False)
+            if updated == 0:
+                # A concurrent consumer won between the check and the
+                # update; the stored body and its state are authoritative.
+                command = (session.query(models.AgentChannelCommand)
+                           .filter_by(uuid=command_uuid,
+                                      session_uuid=session_uuid)
+                           .one())
+                if command.state != AGENT_CHANNEL_COMMAND_CONSUMED:
+                    raise exception.AgentChannelCommandNotReady(
+                        command=command_uuid)
+                return _agent_channel_reply_response(
+                    AGENT_CHANNEL_OUTCOME_REPLY,
+                    _agent_channel_command_dict(command))
+            session.refresh(command)
+            return _agent_channel_reply_response(
+                AGENT_CHANNEL_OUTCOME_REPLY,
+                _agent_channel_command_dict(command))
+
+    def wait_agent_channel_reply(self, node_uuid, session_uuid, command_uuid,
+                                 workflow_epoch, fence, timeout,
+                                 wake_hint=None, wait_interval=None):
+        """Wait for the committed reply of one command.
+
+        The caller may hold the exclusive Node reservation while it waits,
+        exactly as the reservation-safe wake contract requires. The wait
+        itself holds no Node reservation and no database transaction: every
+        journal read is a separate short read-only transaction, so a
+        concurrent report dispatcher can always commit and the reply is
+        visible to the next read. The wait uses a monotonic deadline;
+        repeated wake-ups never extend the deadline. Between reads the
+        optional ``wake_hint`` callback is given a chance to deliver a
+        notification hint; lost hints are safe because the durable journal
+        is the authority.
+
+        When the result is committed the wait consumes the command under
+        the presented fence and returns the stored reply. If the session is
+        superseded while the caller waits, the consume is fenced and the
+        wait returns no reply; the stored result stays in the journal for
+        the report-only acknowledgment path.
+
+        :param node_uuid: UUID of the node whose channel is waited on.
+        :param session_uuid: UUID of the session that published the command.
+        :param command_uuid: UUID of the command to wait on.
+        :param workflow_epoch: Workflow epoch the caller believes is current.
+        :param fence: Fence generation the caller believes is current.
+        :param timeout: Maximum seconds to wait under a monotonic deadline.
+        :param wake_hint: Optional zero-argument callable invoked between
+                          journal reads.
+        :param wait_interval: Seconds to rest between reads. The default is
+                              one second; an empty value lets the wake hint
+                              drive the loop.
+        :returns: A dict with ``outcome`` ``reply`` and the consumed command
+                  dict, or ``outcome`` ``no_reply`` with no command.
+        :raises: NodeNotFound if the node does not exist at wait start.
+        :raises: NotFound if the session or the command does not exist.
+        """
+        if timeout < 0:
+            timeout = 0
+        if wait_interval is None:
+            wait_interval = 1.0
+
+        with _session_for_read() as session:
+            node_id = session.query(models.Node.id).filter(
+                models.Node.uuid == node_uuid).scalar()
+        if node_id is None:
+            raise exception.NodeNotFound(node=node_uuid)
+
+        deadline = time.monotonic() + timeout
+        found = False
+        while time.monotonic() < deadline:
+            with _session_for_read() as session:
+                ref = (session.query(models.AgentChannelCommand)
+                       .filter_by(uuid=command_uuid,
+                                  session_uuid=session_uuid)
+                       .one_or_none())
+            if ref is None:
+                raise exception.NotFound(
+                    _('Agent channel command %s could not be found.')
+                    % command_uuid)
+            if ref.result is not None:
+                found = True
+                break
+            if wake_hint is not None:
+                wake_hint()
+            if wait_interval > 0:
+                time.sleep(wait_interval)
+
+        if not found:
+            return _agent_channel_reply_response(
+                AGENT_CHANNEL_OUTCOME_NO_REPLY, None)
+
+        try:
+            return self.consume_agent_channel_command(
+                node_uuid, session_uuid, command_uuid, workflow_epoch, fence)
+        except exception.AgentChannelFenceConflict:
+            # The session was superseded while the caller waited: this wait
+            # gets no result and the journal is not consumed under a stale
+            # fence.
+            return _agent_channel_reply_response(
+                AGENT_CHANNEL_OUTCOME_NO_REPLY, None)
