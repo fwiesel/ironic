@@ -134,6 +134,24 @@ class AgentChannelApiTestCase(test_api_base.BaseApiTest):
             [], headers=self._headers(version=V114))
         self.assertEqual(http_client.NOT_FOUND, response.status_int)
 
+    def test_work_route_answers_the_pinned_product_header(self):
+        # The deployed gates probe with the standard header under the
+        # product name ("OpenStack-API-Version: ironic 1.115"). That form
+        # must negotiate 1.115 and reach the route, not be silently treated
+        # as the minimum API version.
+        headers = {'OpenStack-API-Version': 'ironic %s' % V115,
+                   TOKEN_HEADER: TOKEN}
+        response = self._post_work(self._work_body(), headers=headers)
+        self.assertEqual(http_client.OK, response.status_int)
+
+    def test_work_probe_shape_answers_at_the_pinned_product_header(self):
+        # The deployed gate probe is noauth: one bounded POST without a
+        # token. At the pinned product header the route must answer with a
+        # defined error (missing token), never 404.
+        headers = {'OpenStack-API-Version': 'ironic %s' % V115}
+        response = self._post_work(self._work_body(), headers=headers)
+        self.assertEqual(http_client.BAD_REQUEST, response.status_int)
+
     # -- work endpoint auth -------------------------------------------------
 
     def test_work_requires_the_token_header(self):

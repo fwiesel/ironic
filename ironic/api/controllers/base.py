@@ -62,6 +62,15 @@ class Version(object):
                                           service_type='baremetal',
                                           legacy_headers=[Version.string])
             if not version_str:
+                # Some clients, including the deployed gate probes, address
+                # the service by its product name ("ironic <version>") in
+                # the standard header rather than the registered service
+                # type ("baremetal"). Negotiate that form explicitly;
+                # otherwise the request would silently fall back to the
+                # minimum version and hide every version-gated route.
+                version_str = mvp.get_version(headers, service_type='ironic',
+                                              legacy_headers=[Version.string])
+            if not version_str:
                 version_str = default_version
             if version_str.lower() == 'latest':
                 version_str = latest_version
