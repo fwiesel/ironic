@@ -76,6 +76,14 @@ class TestVersion(base.BaseApiTest):
             {'OpenStack-API-Version': 'baremetal 123.456'}, mock.ANY, mock.ANY)
         self.assertEqual((123, 456), version)
 
+    def test_parse_standard_header_with_product_name_ok(self):
+        # The deployed gates address the API by the product name
+        # ("ironic 1.115") in the standard header; that form must negotiate
+        # the requested version and not fall back to the minimum.
+        version = cbase.Version.parse_headers(
+            {'OpenStack-API-Version': 'ironic 123.456'}, mock.ANY, mock.ANY)
+        self.assertEqual((123, 456), version)
+
     def test_parse_headers_latest(self):
         for s in ['latest', 'LATEST']:
             version = cbase.Version.parse_headers(
