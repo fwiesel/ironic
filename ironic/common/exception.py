@@ -178,6 +178,14 @@ class AgentChannelFenceConflict(Conflict):
                  "publisher holds no work authority.")
 
 
+class AgentChannelCommandNotReady(Conflict):
+    # NOTE: The message must never carry parameter values. Only the stored
+    # command identity is safe to report.
+    _msg_fmt = _("Agent channel command %(command)s has no committed result "
+                 "to consume; the reply must be stored in the journal "
+                 "before consumption advances anything.")
+
+
 class AgentChannelUnauthorized(IronicException):
     # NOTE: The message must never name the node or the session. A rejected
     # token reveals nothing about which journals exist.
