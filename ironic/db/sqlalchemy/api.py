@@ -117,7 +117,29 @@ def get_backend():
 
 AGENT_CHANNEL_SESSION_ACTIVE = 'active'
 AGENT_CHANNEL_SESSION_DRAINING = 'draining'
+AGENT_CHANNEL_SESSION_CLOSING = 'closing'
+AGENT_CHANNEL_SESSION_CLOSED = 'closed'
 AGENT_CHANNEL_COMMAND_QUEUED = 'queued'
+AGENT_CHANNEL_REPORT_KINDS = ('receipt', 'acceptance', 'result')
+# The wire protocol reports are an independent bounded list. The journal
+# guards its own bound so a single oversized batch cannot exhaust the
+# report transaction.
+AGENT_CHANNEL_REPORT_MAX_ENTRIES = 200
+
+# Work poll outcomes of the wire protocol. A poll carries exactly one
+# outcome: a command envelope, no work, a channel that is not ready for
+# the poller, or a closed session.
+AGENT_CHANNEL_OUTCOME_COMMAND = 'command'
+AGENT_CHANNEL_OUTCOME_NO_WORK = 'no_work'
+AGENT_CHANNEL_OUTCOME_NOT_READY = 'not_ready'
+AGENT_CHANNEL_OUTCOME_CLOSED = 'closed'
+
+AGENT_CHANNEL_ACK_ACKNOWLEDGED = 'acknowledged'
+AGENT_CHANNEL_ACK_DUPLICATE = 'duplicate'
+AGENT_CHANNEL_ACK_CONFLICT = 'conflict'
+AGENT_CHANNEL_ACK_WRONG_EPOCH = 'wrong_epoch'
+AGENT_CHANNEL_ACK_UNKNOWN_COMMAND = 'unknown_command'
+AGENT_CHANNEL_ACK_UNSUPPORTED_KIND = 'unsupported_kind'
 
 # The journal accepts only JSON values as command parameters. Keep the
 # validation and the canonical form in one place so that the stored digest
@@ -208,7 +230,68 @@ def _agent_channel_command_dict(ref):
         'reply_boundary': ref.reply_boundary,
         'params_sha256': ref.params_sha256,
         'state': ref.state,
+        'receipt': ref.receipt,
+        'acceptance': ref.acceptance,
+        'result': ref.result,
     }
+
+
+def _ingest_agent_channel_report(session, session_uuid, entry):
+    """Store one agent channel report and return its acknowledgment.
+
+    The acknowledgment carries only the command ID, the report kind, and a
+    disposition. It never carries the payload, so a rejected report cannot
+    leak its values.
+
+    A changed payload for an already committed kind leaves the stored
+    payload untouched: the journal never acknowledges a command and then
+    discards or mutates its stored body.
+    """
+    if not isinstance(entry, dict):
+        raise exception.InvalidParameterValue(
+            _('Each agent channel report entry must be a JSON object.'))
+    command_id = entry.get('command_id')
+    workflow_epoch = entry.get('workflow_epoch')
+    kind = entry.get('kind')
+    ack = {'command_id': command_id, 'kind': kind}
+
+    if kind not in AGENT_CHANNEL_REPORT_KINDS:
+        ack['disposition'] = AGENT_CHANNEL_ACK_UNSUPPORTED_KIND
+        return ack
+
+    # Lock the stored command row before the slot check. A plain read can
+    # answer from a snapshot that this transaction took before a concurrent
+    # reporter committed, so two writers could both see an absent slot. The
+    # locking read is a current read, and populate_existing refreshes a row
+    # that an earlier query in this transaction already loaded. A missing
+    # slot stays absent as SQL NULL and as JSON null: both decode to None.
+    command = (session.query(models.AgentChannelCommand)
+               .filter_by(uuid=command_id, session_uuid=session_uuid)
+               .populate_existing()
+               .with_for_update()
+               .one_or_none())
+    if command is None:
+        ack['disposition'] = AGENT_CHANNEL_ACK_UNKNOWN_COMMAND
+        return ack
+
+    if workflow_epoch != command.workflow_epoch:
+        ack['disposition'] = AGENT_CHANNEL_ACK_WRONG_EPOCH
+        return ack
+
+    canonical = _canonical_agent_channel_json(
+        entry.get('payload'),
+        _('Agent channel report payloads must be a JSON object '
+          'with string keys and JSON values.'))
+    slot = getattr(command, kind)
+    if slot is None:
+        setattr(command, kind, json.loads(canonical))
+        ack['disposition'] = AGENT_CHANNEL_ACK_ACKNOWLEDGED
+    elif json.dumps(slot, sort_keys=True,
+                    separators=(',', ':')) == canonical:
+        ack['disposition'] = AGENT_CHANNEL_ACK_DUPLICATE
+    else:
+        ack['disposition'] = AGENT_CHANNEL_ACK_CONFLICT
+    return ack
 
 
 def _agent_channel_session_dict(ref):
@@ -3643,3 +3726,37 @@ class Connection(api.Connection):
                     _('Agent channel command %s could not be found.')
                     % command_uuid)
             return _agent_channel_command_dict(ref)
+
+    @wrap_sqlite_retry
+    @oslo_db_api.retry_on_deadlock
+    def report_agent_channel(self, session_uuid, reports):
+        """Ingest a bounded list of agent reports into the journal.
+
+        Each report entry is a dict with ``command_id``, ``workflow_epoch``,
+        ``kind``, and ``payload``. The payload must be a JSON object, the
+        same shape the journal requires for command parameters. The journal
+        stores the payload in the command's report slot of that kind and
+        returns one acknowledgment dict per entry.
+
+        Ingestion is the reply path: it makes no Node update and no workflow
+        advance. A late report for a stored command of a superseded session
+        is still acknowledged; the command row carries its session, so no
+        session-state check gates the acknowledgment.
+        """
+        if not isinstance(reports, list):
+            raise exception.InvalidParameterValue(
+                _('Agent channel reports must be a bounded list.'))
+        if len(reports) > AGENT_CHANNEL_REPORT_MAX_ENTRIES:
+            raise exception.InvalidParameterValue(
+                _('Agent channel report list exceeds the allowed bound of '
+                  '%d entries.') % AGENT_CHANNEL_REPORT_MAX_ENTRIES)
+
+        acks = []
+        with _session_for_write() as session:
+            _require_agent_channel_session(session, session_uuid)
+
+            for entry in reports:
+                acks.append(_ingest_agent_channel_report(session,
+                                                         session_uuid,
+                                                         entry))
+        return acks

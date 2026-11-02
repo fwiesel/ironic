@@ -923,7 +923,7 @@ RELEASE_MAPPING = {
         'api': '1.101',
         'rpc': '1.61',
         'objects': {
-            'AgentChannelCommand': ['1.0'],
+            'AgentChannelCommand': ['1.1', '1.0'],
             'AgentChannelHead': ['1.0'],
             'AgentChannelSession': ['1.0'],
             'Allocation': ['1.3', '1.2', '1.1'],
