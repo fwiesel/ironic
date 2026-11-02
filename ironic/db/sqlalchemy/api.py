@@ -354,6 +354,66 @@ def _check_agent_channel_fence(session, node_id, session_ref,
     return head
 
 
+def _agent_channel_envelope(ref, session):
+    """Build the wire envelope of one stored command.
+
+    The envelope is the stored command dict plus the session execution ID,
+    minus the journal-internal invocation key and parameter digest: those
+    fields never leave the journal over the wire. The terminal admission
+    slot belongs to the terminal barrier unit and is not stored yet, so it
+    does not appear here.
+    """
+    envelope = _agent_channel_command_dict(ref)
+    envelope['execution_id'] = session.execution_id
+    del envelope['invocation_key']
+    del envelope['params_sha256']
+    return envelope
+
+
+def _next_agent_channel_command(session, session_uuid):
+    """The oldest queued command of a session that is not yet received.
+
+    A stored receipt is the durable proof that the delivery was accepted. A
+    lost delivery response must stay retrievable until then, so only
+    commands without a stored receipt are delivered. The journal keeps a
+    missing report slot as JSON null, which decodes to ``None``; stored
+    report payloads are always JSON objects, so ``receipt is None`` is
+    exactly the not-yet-received state. Consumption is a later unit and
+    changes the command state, which takes the command out of this query as
+    well.
+    """
+    refs = (session.query(models.AgentChannelCommand)
+            .filter_by(session_uuid=session_uuid,
+                       state=AGENT_CHANNEL_COMMAND_QUEUED)
+            .order_by(models.AgentChannelCommand.sequence.asc())
+            .all())
+    for ref in refs:
+        if ref.receipt is None:
+            return ref
+    return None
+
+
+def _agent_channel_work_response(outcome, state, epoch, command):
+    return {
+        'outcome': outcome,
+        'state': state,
+        'epoch': epoch,
+        'command': command,
+        'retry_after': 0,
+    }
+
+
+def _agent_channel_work_not_ready():
+    """The channel is not ready for this poller; no identity is revealed."""
+    return {
+        'outcome': AGENT_CHANNEL_OUTCOME_NOT_READY,
+        'state': None,
+        'epoch': None,
+        'command': None,
+        'retry_after': 0,
+    }
+
+
 def _session_for_read():
     return _wrap_session(enginefacade.reader.using(_CONTEXT))
 
@@ -3943,3 +4003,81 @@ class Connection(api.Connection):
                                                          session_uuid,
                                                          entry))
         return acks
+
+    def poll_agent_channel_work(self, node_uuid, session_uuid, execution_id,
+                                workflow_epoch):
+        """Resolve one agent work poll against the journal. Read-only.
+
+        The poll answers the wire ``work`` request at the journal boundary:
+        it returns the session execution epoch, the session state, and
+        exactly one outcome (``command``, ``no_work``, ``not_ready``, or
+        ``closed``). A ``command`` outcome carries the wire envelope of the
+        oldest queued command of the session that has no stored receipt; a
+        lost delivery stays retrievable until the receipt is durable.
+
+        The poll is the delivery side only. It never consumes a command,
+        never advances the workflow epoch, never mutates the head or the
+        session, and never touches the Node row. Fencing rules: a poll
+        whose session is superseded reads state ``draining`` and gets
+        ``no_work``; a stale workflow epoch gets ``no_work`` with the
+        current epoch; an unknown session, a session of another node, a
+        mismatched execution identity, and a node without a channel get
+        ``not_ready`` without revealing any journal identity.
+
+        :param node_uuid: UUID of the node whose channel is polled.
+        :param session_uuid: UUID of the polling session.
+        :param execution_id: Stable UUID of one agent execution process.
+        :param workflow_epoch: Workflow epoch the poller believes is current.
+        :returns: A poll result dict with the keys ``outcome``, ``state``,
+                  ``epoch``, ``command``, and ``retry_after``.
+        :raises: NodeNotFound if the node does not exist.
+        """
+        with _session_for_read() as session:
+            node_id = _agent_channel_node_id(session, node_uuid)
+
+            head = (session.query(models.AgentChannelHead)
+                    .filter_by(node_id=node_id)
+                    .one_or_none())
+            if head is None:
+                return _agent_channel_work_not_ready()
+
+            ref = (session.query(models.AgentChannelSession)
+                   .filter_by(uuid=session_uuid)
+                   .one_or_none())
+            if (ref is None or ref.node_id != node_id
+                    or ref.execution_id != execution_id):
+                return _agent_channel_work_not_ready()
+
+            epoch = head.workflow_epoch
+            if ref.state == AGENT_CHANNEL_SESSION_CLOSED:
+                return _agent_channel_work_response(
+                    AGENT_CHANNEL_OUTCOME_CLOSED, ref.state, epoch, None)
+
+            current = (head.session_uuid == session_uuid
+                       and head.fence == ref.fence
+                       and head.workflow_epoch == ref.workflow_epoch)
+            if not current:
+                # A superseded session reads state draining; its poll is
+                # answered but carries no new work and no consume.
+                return _agent_channel_work_response(
+                    AGENT_CHANNEL_OUTCOME_NO_WORK,
+                    AGENT_CHANNEL_SESSION_DRAINING, epoch, None)
+
+            if ref.state in (AGENT_CHANNEL_SESSION_DRAINING,
+                             AGENT_CHANNEL_SESSION_CLOSING):
+                return _agent_channel_work_response(
+                    AGENT_CHANNEL_OUTCOME_NO_WORK, ref.state, epoch, None)
+
+            if ref.workflow_epoch != workflow_epoch:
+                # A stale poller gets no work; the response carries the
+                # current epoch so it can resynchronize.
+                return _agent_channel_work_response(
+                    AGENT_CHANNEL_OUTCOME_NO_WORK, ref.state, epoch, None)
+
+            command = _next_agent_channel_command(session, session_uuid)
+            if command is None:
+                return _agent_channel_work_response(
+                    AGENT_CHANNEL_OUTCOME_NO_WORK, ref.state, epoch, None)
+            return _agent_channel_work_response(
+                AGENT_CHANNEL_OUTCOME_COMMAND, ref.state, epoch,
+                _agent_channel_envelope(command, ref))
