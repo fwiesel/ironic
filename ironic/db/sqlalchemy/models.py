@@ -756,6 +756,15 @@ class AgentChannelCommand(Base):
     reply_boundary = Column(String(32), nullable=False)
     params_sha256 = Column(String(64), nullable=False)
     state = Column(String(16), nullable=False, default='queued')
+    # Report slots of the command. Each holds the stored payload of one
+    # report kind (receipt, acceptance, result). The base JSON type keeps a
+    # missing slot as NULL, so absent and stored stay distinguishable.
+    receipt = Column(db_types.JsonEncodedType(mysql_as_long=True),
+                     nullable=True)
+    acceptance = Column(db_types.JsonEncodedType(mysql_as_long=True),
+                        nullable=True)
+    result = Column(db_types.JsonEncodedType(mysql_as_long=True),
+                    nullable=True)
 
 
 def get_class(model_name):

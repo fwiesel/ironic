@@ -1102,7 +1102,7 @@ RELEASE_MAPPING = {
         'rpc': '1.62',
         'networking_rpc': '1.1',
         'objects': {
-            'AgentChannelCommand': ['1.0'],
+            'AgentChannelCommand': ['1.1', '1.0'],
             'AgentChannelHead': ['1.0'],
             'AgentChannelSession': ['1.0'],
             'Allocation': ['1.3', '1.2', '1.1'],
